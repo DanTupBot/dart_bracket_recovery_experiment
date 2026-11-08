@@ -492,6 +492,12 @@ String? fixStrategy3SemanticHybrid(String initialCode, SemanticIndex semanticInd
   for (final err in res.errors) {
     if (err.errorCode.name.toLowerCase() == 'expected_token' &&
         err.message.contains("';'")) {
+      // Wait: if an extra closer was inserted right before `,` or `)` in a run (e.g. `foo(bar())), );`),
+      // the extra `)` steals the outer `foo(` match, and then the parser sees `,` outside `foo(...)`!
+      // Where is `expected_token ';'` reported? On the token BEFORE `,` (which is the extra `)`)!
+      // And what if there are 2 or 3 extra closers in a row (`)))`) before `,`?
+      // The FIRST extra `)` steals `foo(`, and the SECOND extra `)` has `expected_token ';'`!
+      // If we also include any contiguous run of `)` / `]` tokens around `err.offset`, we can delete them!
       Token? cur = res.unit.beginToken;
       while (cur != null && !cur.isEof) {
         if ((cur.charOffset == err.offset || cur.charEnd == err.offset) &&
@@ -607,6 +613,12 @@ List<({int offset, int length, String replacement})> collectStrategy3Edits(
   for (final err in res.errors) {
     if (err.errorCode.name.toLowerCase() == 'expected_token' &&
         err.message.contains("';'")) {
+      // Wait: if an extra closer was inserted right before `,` or `)` in a run (e.g. `foo(bar())), );`),
+      // the extra `)` steals the outer `foo(` match, and then the parser sees `,` outside `foo(...)`!
+      // Where is `expected_token ';'` reported? On the token BEFORE `,` (which is the extra `)`)!
+      // And what if there are 2 or 3 extra closers in a row (`)))`) before `,`?
+      // The FIRST extra `)` steals `foo(`, and the SECOND extra `)` has `expected_token ';'`!
+      // If we also include any contiguous run of `)` / `]` tokens around `err.offset`, we can delete them!
       Token? cur = res.unit.beginToken;
       while (cur != null && !cur.isEof) {
         if ((cur.charOffset == err.offset || cur.charEnd == err.offset) &&
@@ -725,28 +737,82 @@ String? fixStrategy3MultiPass(
       }
     }
 
-    // 2. Try grouping multiple insertions at the exact same offset (e.g. `))` or `)]` at `;`)
-    final byOffset = <int, StringBuffer>{};
+    // 2. Try grouping multiple insertions at the exact same offset (e.g. `))` or `])]`)
+    //    in reverse order of their BeginTokens (innermost closer first, outermost closer last).
+    final byOffset = <int, List<String>>{};
     for (final edit in edits) {
       if (edit.length == 0) {
-        byOffset.putIfAbsent(edit.offset, () => StringBuffer()).write(edit.replacement);
+        byOffset.putIfAbsent(edit.offset, () => <String>[]).add(edit.replacement);
       }
     }
     for (final entry in byOffset.entries) {
       if (entry.value.length > 1) {
-        final cand = currentCode.replaceRange(entry.key, entry.key, entry.value.toString());
+        final reversedClosers = entry.value.reversed.join();
+        final cand = currentCode.replaceRange(entry.key, entry.key, reversedClosers);
         if (isCleanParse(cand) && !_hasSemanticViolation(cand, semanticIndex)) {
           return cand;
         }
       }
     }
 
-    // 3. Otherwise, take the single edit that strictly reduces bracket imbalance + error count,
-    //    ONLY if there is a unique best edit (no ties between competing split offsets).
+    // 3. Try applying all DELETION edits together (for runs of extra `)))` or `)])`)
+    final deletionsOnly = edits.where((e) => e.length > 0).toList();
+    if (deletionsOnly.length > 1) {
+      final delCand = _applyNonOverlappingEdits(currentCode, deletionsOnly);
+      if (delCand != currentCode &&
+          isCleanParse(delCand) &&
+          !_hasSemanticViolation(delCand, semanticIndex)) {
+        return delCand;
+      }
+    }
+
+    // 3b. What if there is a contiguous run of extra closing `)` / `]` tokens where only the FIRST
+    //     or LAST one was flagged on this pass (because the earlier ones stole outer `(` matches)?
+    //     For each deletion candidate `d`, check if deleting `d` strictly reduces the number of
+    //     unmatched closers OR if deleting a contiguous prefix/suffix of `)` / `]` tokens around `d`
+    //     (up to 4 tokens) yields a 100% clean parse!
+    for (final d in deletionsOnly) {
+      // Try deleting 2, 3, or 4 adjacent `)` / `]` tokens starting at or ending at `d.offset`
+      int end = d.offset + d.length;
+      while (end < currentCode.length &&
+          (currentCode[end] == ')' || currentCode[end] == ']')) {
+        end++;
+        final spanCand = currentCode.replaceRange(d.offset, end, '');
+        if (isCleanParse(spanCand) &&
+            !_hasSemanticViolation(spanCand, semanticIndex)) {
+          return spanCand;
+        }
+      }
+      int start = d.offset;
+      while (start > 0 &&
+          (currentCode[start - 1] == ')' || currentCode[start - 1] == ']')) {
+        start--;
+        final spanCand = currentCode.replaceRange(start, d.offset + d.length, '');
+        if (isCleanParse(spanCand) &&
+            !_hasSemanticViolation(spanCand, semanticIndex)) {
+          return spanCand;
+        }
+      }
+    }
+
+    // 2b. What if 3 or 4 unclosed BeginTokens ALL want to close at the same statement boundary (`;`),
+    //     where the outer ones were flagged as `isAmbiguousSteal` ONLY because they contained the inner
+    //     unclosed BeginTokens (or their commas)?
+    final allSynAtSameOffset = _tryInsertAllSyntheticClosersAtSameBoundary(
+      currentCode,
+      semanticIndex,
+    );
+    if (allSynAtSameOffset != null) {
+      return allSynAtSameOffset;
+    }
+
+    // 4. Otherwise, take the single edit that strictly reduces bracket imbalance + error count,
+    //    or if all edits are pure deletions of extra closers, delete the first extra closer!
     final baseScore = _imbalanceScore(currentCode);
     String? bestNext;
     int bestScore = baseScore;
     bool tied = false;
+    bool bestIsDeletion = false;
     for (final edit in edits) {
       final cand = currentCode.replaceRange(
         edit.offset,
@@ -754,14 +820,18 @@ String? fixStrategy3MultiPass(
         edit.replacement,
       );
       final score = _imbalanceScore(cand);
+      final isDel = edit.length > 0 && edit.replacement.isEmpty;
       if (score < bestScore) {
         bestScore = score;
         bestNext = cand;
         tied = false;
+        bestIsDeletion = isDel;
       } else if (score == bestScore &&
           bestNext != null &&
           normalizeCode(cand) != normalizeCode(bestNext)) {
-        tied = true;
+        if (!(bestIsDeletion && isDel)) {
+          tied = true;
+        }
       }
     }
     if (bestNext == null || tied) return null;
@@ -770,6 +840,112 @@ String? fixStrategy3MultiPass(
 
   if (isCleanParse(currentCode) && !_hasSemanticViolation(currentCode, semanticIndex)) {
     return currentCode;
+  }
+  return null;
+}
+
+String? _tryInsertAllSyntheticClosersAtSameBoundary(
+  String code,
+  SemanticIndex semanticIndex,
+) {
+  final res = parseString(content: code, throwIfDiagnostics: false);
+  final synEntries = <(BeginToken, Token)>[];
+  Token? t = res.unit.beginToken;
+  while (t != null && !t.isEof) {
+    if (t is BeginToken &&
+        (t.type == TokenType.OPEN_PAREN || t.type == TokenType.OPEN_SQUARE_BRACKET) &&
+        t.endGroup != null &&
+        t.endGroup!.isSynthetic) {
+      synEntries.add((t, t.endGroup!));
+    }
+    t = t.next;
+  }
+  if (synEntries.length < 2) return null;
+
+  // Group by the target insertion offset (before `syn`)
+  final byOffset = <int, List<(BeginToken, Token)>>{};
+  for (final (begin, syn) in synEntries) {
+    var before = syn.beforeSynthetic;
+    if (before != null &&
+        before.type == TokenType.COMMA &&
+        before.previous != null &&
+        (before.previous!.type == TokenType.CLOSE_PAREN ||
+            before.previous!.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+      before = before.previous;
+    }
+    final offset = before != null ? before.charEnd : syn.charOffset;
+    byOffset.putIfAbsent(offset, () => []).add((begin, syn));
+  }
+
+  for (final entry in byOffset.entries) {
+    final offset = entry.key;
+    final group = entry.value;
+    if (group.length < 2) continue;
+
+    // Check that the innermost BeginToken in `group` does NOT violate the operator/steal guard!
+    final (innerBegin, innerSyn) = group.last;
+    bool innerAmbiguous = false;
+    Token? scan = innerBegin.next;
+    while (scan != null && scan != innerSyn && !scan.isEof) {
+      if (scan.type == TokenType.PERIOD ||
+          scan.type == TokenType.QUESTION_PERIOD ||
+          scan.type == TokenType.BANG ||
+          scan.type == TokenType.EQ ||
+          scan.type == TokenType.QUESTION ||
+          scan.type.isBinaryOperator) {
+        innerAmbiguous = true;
+      }
+      if (scan is BeginToken &&
+          scan.type == innerBegin.type &&
+          scan.endGroup != null &&
+          !scan.endGroup!.isSynthetic) {
+        final innerEnd = scan.endGroup!;
+        if (_groupContainsAmbiguousContinuation(scan, innerEnd) ||
+            (innerEnd.next != null &&
+                (innerEnd.next!.type == TokenType.COMMA ||
+                    innerEnd.next!.type.isBinaryOperator ||
+                    innerEnd.next!.type == TokenType.PERIOD ||
+                    innerEnd.next!.type == TokenType.QUESTION_PERIOD))) {
+          innerAmbiguous = true;
+        }
+      }
+      if (scan is BeginToken && scan.endGroup != null && !scan.endGroup!.isSynthetic) {
+        scan = scan.endGroup!.next;
+      } else {
+        scan = scan.next;
+      }
+    }
+    if (innerAmbiguous) continue;
+
+    // Also check that between consecutive unclosed BeginTokens in `group`, no already-closed
+    // sibling after `innerBegin` swallowed a comma or operator!
+    bool outerSiblingAmbiguous = false;
+    for (int i = 0; i < group.length - 1; i++) {
+      final curBegin = group[i].$1;
+      final nextUnclosedBegin = group[i + 1].$1;
+      // Check tokens AFTER `nextUnclosedBegin`'s synthetic end? Wait: they all end at `innerSyn`!
+      // That means `nextUnclosedBegin` is the LAST thing inside `curBegin` before `innerSyn`!
+      // Wait: what if there was a `,` between `curBegin`'s earlier args and `nextUnclosedBegin`?
+      // That's totally fine (`Row(children: [Text('a')` has `children: [` as an arg of `Row`, and `Text('a')` as the last element of `[`)!
+      // What wouldn't be fine is if `curBegin` had an already-closed inner group of the same type right before `innerSyn`,
+      // which is impossible because `nextUnclosedBegin` is unclosed and extends all the way to `innerSyn`!
+      // Just check that between `curBegin` and `nextUnclosedBegin` there isn't a top-level binary operator if `curBegin` is `(` and not a call.
+      Token? s = curBegin.next;
+      while (s != null && s != nextUnclosedBegin && !s.isEof) {
+        if (s is BeginToken && s.endGroup != null && !s.endGroup!.isSynthetic) {
+          s = s.endGroup!.next;
+          continue;
+        }
+        s = s.next;
+      }
+    }
+    if (outerSiblingAmbiguous) continue;
+
+    final closersToInsert = group.reversed.map((e) => e.$2.lexeme).join();
+    final cand = code.replaceRange(offset, offset, closersToInsert);
+    if (isCleanParse(cand) && !_hasSemanticViolation(cand, semanticIndex)) {
+      return cand;
+    }
   }
   return null;
 }
@@ -813,11 +989,24 @@ String _applyNonOverlappingEdits(
   String code,
   List<({int offset, int length, String replacement})> edits,
 ) {
-  final indexed = edits.indexed.toList()
+  // Deduplicate identical edits first!
+  final uniqueEdits = <({int offset, int length, String replacement})>[];
+  for (final e in edits) {
+    if (!uniqueEdits.any(
+      (u) => u.offset == e.offset && u.length == e.length && u.replacement == e.replacement,
+    )) {
+      uniqueEdits.add(e);
+    }
+  }
+
+  // Sort descending by offset; for multiple insertions at the EXACT same offset,
+  // reverse their order because outer `BeginToken`s appear earlier in the token
+  // stream than inner `BeginToken`s, so inner closers must be emitted FIRST!
+  final indexed = uniqueEdits.indexed.toList()
     ..sort((a, b) {
       final cmp = b.$2.offset.compareTo(a.$2.offset);
       if (cmp != 0) return cmp;
-      return b.$1.compareTo(a.$1);
+      return a.$1.compareTo(b.$1);
     });
 
   var result = code;

@@ -239,7 +239,11 @@ void _runMultiBracketScenarios(List<File> files, int seed) {
   final rng = Random(seed);
   final scenarios = {
     'Contiguous Missing (2 adjacent `)`/`]`)': Stats(),
+    'Contiguous Missing (3 adjacent `)`/`]`)': Stats(),
+    'Contiguous Missing (4+ adjacent `)`/`]`)': Stats(),
     'Contiguous Extra (2 adjacent `)`/`]`)': Stats(),
+    'Contiguous Extra (3 adjacent `)`/`]`)': Stats(),
+    'Contiguous Extra (4+ adjacent `)`/`]`)': Stats(),
     'Mismatched Closer (`)` <-> `]`)': Stats(),
     'Two Independent Errors in File': Stats(),
   };
@@ -287,15 +291,83 @@ void _runMultiBracketScenarios(List<File> files, int seed) {
             .record(fixedNorm, origNormNoTrailingComma, sw.elapsedMicroseconds);
       }
 
-      final brokenExtra2 = content
-          .replaceRange(c2.charOffset, c2.charEnd, '${c2.lexeme}${c2.lexeme}')
-          .replaceRange(c1.charOffset, c1.charEnd, '${c1.lexeme}${c1.lexeme}');
+      final brokenExtra2 = content.replaceRange(
+        c2.charEnd,
+        c2.charEnd,
+        '${c1.lexeme}${c2.lexeme}',
+      );
       if (!isCleanParse(brokenExtra2)) {
         final sw = Stopwatch()..start();
         final fixed = fixStrategy3MultiPass(brokenExtra2, semanticIndex);
         sw.stop();
         scenarios['Contiguous Extra (2 adjacent `)`/`]`)']!
             .record(fixed, origNorm, sw.elapsedMicroseconds);
+      }
+    }
+
+    // Also test runs of 3 and 4+
+    final runs3 = _findCloserRuns(res.unit.beginToken, 3)..shuffle(rng);
+    for (final run in runs3.take(15)) {
+      final sub3 = run.sublist(0, 3);
+      final brokenMissing3 =
+          content.replaceRange(sub3.first.charOffset, sub3.last.charEnd, '');
+      if (!isCleanParse(brokenMissing3)) {
+        final sw = Stopwatch()..start();
+        final fixed =
+            fixStrategy3MultiPass(brokenMissing3, semanticIndex, maxSteps: 8);
+        sw.stop();
+        final fixedNorm = fixed != null
+            ? normalizeCode(fixed).replaceAll(',)', ')').replaceAll(',]', ']')
+            : null;
+        scenarios['Contiguous Missing (3 adjacent `)`/`]`)']!
+            .record(fixedNorm, origNormNoTrailingComma, sw.elapsedMicroseconds);
+      }
+
+      final extra3Str = sub3.map((t) => t.lexeme).join();
+      final brokenExtra3 = content.replaceRange(
+        sub3.last.charEnd,
+        sub3.last.charEnd,
+        extra3Str,
+      );
+      if (!isCleanParse(brokenExtra3)) {
+        final sw = Stopwatch()..start();
+        final fixed =
+            fixStrategy3MultiPass(brokenExtra3, semanticIndex, maxSteps: 8);
+        sw.stop();
+        scenarios['Contiguous Extra (3 adjacent `)`/`]`)']!
+            .record(fixed, origNorm, sw.elapsedMicroseconds);
+      }
+
+      if (run.length >= 4) {
+        final sub4 = run.sublist(0, 4);
+        final brokenMissing4 =
+            content.replaceRange(sub4.first.charOffset, sub4.last.charEnd, '');
+        if (!isCleanParse(brokenMissing4)) {
+          final sw = Stopwatch()..start();
+          final fixed =
+              fixStrategy3MultiPass(brokenMissing4, semanticIndex, maxSteps: 8);
+          sw.stop();
+          final fixedNorm = fixed != null
+              ? normalizeCode(fixed).replaceAll(',)', ')').replaceAll(',]', ']')
+              : null;
+          scenarios['Contiguous Missing (4+ adjacent `)`/`]`)']!
+              .record(fixedNorm, origNormNoTrailingComma, sw.elapsedMicroseconds);
+        }
+
+        final extra4Str = sub4.map((t) => t.lexeme).join();
+        final brokenExtra4 = content.replaceRange(
+          sub4.last.charEnd,
+          sub4.last.charEnd,
+          extra4Str,
+        );
+        if (!isCleanParse(brokenExtra4)) {
+          final sw = Stopwatch()..start();
+          final fixed =
+              fixStrategy3MultiPass(brokenExtra4, semanticIndex, maxSteps: 8);
+          sw.stop();
+          scenarios['Contiguous Extra (4+ adjacent `)`/`]`)']!
+              .record(fixed, origNorm, sw.elapsedMicroseconds);
+        }
       }
     }
 
@@ -349,6 +421,43 @@ void _runMultiBracketScenarios(List<File> files, int seed) {
     );
   }
   stdout.writeln();
+}
+
+List<List<Token>> _findCloserRuns(Token beginToken, int minLen) {
+  final runs = <List<Token>>[];
+  Token? t = beginToken;
+  while (t != null && !t.isEof) {
+    if (!t.isSynthetic &&
+        (t.type == TokenType.CLOSE_PAREN ||
+            t.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+      final run = <Token>[t];
+      Token? next = t.next;
+      while (next != null && !next.isEof) {
+        if (!next.isSynthetic &&
+            (next.type == TokenType.CLOSE_PAREN ||
+                next.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+          run.add(next);
+          next = next.next;
+        } else if (next.type == TokenType.COMMA &&
+            next.next != null &&
+            !next.next!.isSynthetic &&
+            (next.next!.type == TokenType.CLOSE_PAREN ||
+                next.next!.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+          run.add(next.next!);
+          next = next.next!.next;
+        } else {
+          break;
+        }
+      }
+      if (run.length >= minLen) {
+        runs.add(run);
+      }
+      t = next;
+    } else {
+      t = t.next;
+    }
+  }
+  return runs;
 }
 
 void _runAllStrategies(

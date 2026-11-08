@@ -99,9 +99,13 @@ When pasting code, there are often **multiple** missing/extra brackets at once (
 
 | Scenario | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Contiguous Missing (2 adjacent `)`/`]`)** | 138 | 34 (24.6%) | 0 (0.0%) | 104 (75.4%) | **100.0%** | 4.35 ms |
-| **Contiguous Extra (2 adjacent `)`/`]`)** | 138 | 109 (79.0%) | 0 (0.0%) | 29 (21.0%) | **100.0%** | 23.18 ms |
-| **Mismatched Closer (`)` <-> `]`)** | 210 | 103 (49.0%) | 0 (0.0%) | 107 (51.0%) | **100.0%** | 6.63 ms |
-| **Two Independent Errors in File** | 126 | 42 (33.3%) | 0 (0.0%) | 84 (66.7%) | **100.0%** | 8.88 ms |
-| **Total Multi-Bracket** | **612** | **288 (47.1%)** | **0 (0.0%)** | **324 (52.9%)** | **100.0%** | **10.33 ms** |
+| **Contiguous Missing (2 adjacent `)`/`]`)** | 138 | 67 (48.6%) | 0 (0.0%) | 71 (51.4%) | **100.0%** | 4.19 ms |
+| **Contiguous Missing (3 adjacent `)`/`]`)** | 33 | 10 (30.3%) | 0 (0.0%) | 23 (69.7%) | **100.0%** | 8.02 ms |
+| **Contiguous Missing (4+ adjacent `)`/`]`)** | 15 | 5 (33.3%) | 0 (0.0%) | 10 (66.7%) | **100.0%** | 8.13 ms |
+| **Contiguous Extra (2 adjacent `)`/`]`)** | 138 | 131 (94.9%) | 0 (0.0%) | 7 (5.1%) | **100.0%** | 10.51 ms |
+| **Contiguous Extra (3 adjacent `)`/`]`)** | 33 | 31 (93.9%) | 0 (0.0%) | 2 (6.1%) | **100.0%** | 31.90 ms |
+| **Contiguous Extra (4+ adjacent `)`/`]`)** | 15 | 14 (93.3%) | 0 (0.0%) | 1 (6.7%) | **100.0%** | 41.42 ms |
+| **Mismatched Closer (`)` <-> `]`)** | 210 | 106 (50.5%) | 0 (0.0%) | 104 (49.5%) | **100.0%** | 6.65 ms |
+| **Two Independent Errors in File** | 130 | 47 (36.2%) | 0 (0.0%) | 83 (63.8%) | **100.0%** | 10.37 ms |
+| **Total Multi-Bracket** | **712** | **411 (57.7%)** | **0 (0.0%)** | **301 (42.3%)** | **100.0%** | **9.66 ms** |
 
