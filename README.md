@@ -35,13 +35,13 @@ Under the hood, `_fe_analyzer_shared` already maintains rich bracket-pairing met
 1. **Strategy 1: Raw Syntactic Token-Stream + Re-parse Sandbox**
    - Uses `BeginToken.endGroup` (synthetic closers) to propose insertions and unmatched real closers to propose deletions.
    - Re-parses candidate edits in memory and accepts the edit if it yields **0 syntax errors and 0 synthetic tokens** (preventing false positives where the parser hallucinated a zero-length `SyntheticStringToken` identifier).
-2. **Strategy 2: Guarded Syntactic Sandbox**
+2. **Strategy 2: Guarded Syntactic Sandbox (Zero-Breakage Syntactic Rules)**
    - Excludes `{` / `}` from batch auto-fixing (moving `}` across statements inside a block is almost always syntactically valid Dart, but changes control flow).
-   - Also detects extra `)` / `]` tokens that stole an outer `(` match mid-expression (where the parser reports `Expected to find ';'` right at the extra closer).
-   - Rejects ambiguous nested same-bracket steals where an unclosed `(` or `[` spans across a `,`, `.property`, `?.property`, or binary operator.
+   - Detects extra `)` / `]` tokens that stole an outer `(` match mid-expression (where the parser reports `Expected to find ';'` right at the extra closer).
+   - Rejects ambiguous `(` / `[` insertions where the unclosed group spans across an operator (`.`, `?.`, `!`, `=`, `?`, or binary operators) or contains an inner group of the same bracket kind that swallowed a comma or operator, and places synthetic closers before trailing commas when preceded by `)` / `]`.
 3. **Strategy 3: Hybrid (Guarded Syntactic + Semantic Argument/Property Hints)**
-   - Simulates using the already-computed semantic diagnostics (`undefined_named_parameter`, `extra_positional_arguments`, `undefined_getter`) that the analysis server already has on `ResolvedUnitResult.diagnostics` during quick-fix computation.
-   - When an inner `(` steals an outer `)` and swallows outer arguments (e.g., `EdgeInsets.all(8, child: Text('hi'))`), the analyzer sees that `child:` is not defined on `EdgeInsets.all` and proposes closing `)` right before `child:`.
+   - Combines Strategy 2 with the already-computed semantic diagnostics (`undefined_named_parameter`, `extra_positional_arguments`, `undefined_getter`) that the analysis server already has on `ResolvedUnitResult.diagnostics` during quick-fix computation.
+   - When an inner `(` steals an outer `)` and swallows outer arguments (e.g., `EdgeInsets.all(8, child: Text('hi'))`), the analyzer sees that `child:` is not defined on `EdgeInsets.all` and proposes closing `)` right before `child:` (provided the previous argument doesn't end with an ambiguous nested call).
 
 ---
 
@@ -56,46 +56,33 @@ Under the hood, `_fe_analyzer_shared` already maintains rich bracket-pairing met
 | Mutation Type | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Missing `)`** | 252 | 166 (65.9%) | 44 (17.5%) | 42 (16.7%) | **79.0%** | 1.05 ms |
-| **Missing `]`** | 3 | 1 (33.3%) | 0 (0.0%) | 2 (66.7%) | **100.0%** | 2.57 ms |
-| **Missing `}`** | 95 | 25 (26.3%) | 24 (25.3%) | 46 (48.4%) | **51.0%** | 4.06 ms |
-| **Extra `)`** | 252 | 195 (77.4%) | 0 (0.0%) | 57 (22.6%) | **100.0%** | 1.21 ms |
-| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 2.81 ms |
-| **Extra `}`** | 94 | 30 (31.9%) | 17 (18.1%) | 47 (50.0%) | **63.8%** | 1.99 ms |
-| **Total `()` / `[]`** | **510** | **365 (71.6%)** | **44 (8.6%)** | **101 (19.8%)** | **89.2%** | **1.15 ms** |
+| **Missing `]`** | 3 | 1 (33.3%) | 0 (0.0%) | 2 (66.7%) | **100.0%** | 2.70 ms |
+| **Missing `}`** | 95 | 25 (26.3%) | 24 (25.3%) | 46 (48.4%) | **51.0%** | 4.20 ms |
+| **Extra `)`** | 252 | 195 (77.4%) | 0 (0.0%) | 57 (22.6%) | **100.0%** | 1.20 ms |
+| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 2.72 ms |
+| **Extra `}`** | 94 | 30 (31.9%) | 17 (18.1%) | 47 (50.0%) | **63.8%** | 1.89 ms |
+| **Total `()` / `[]`** | **510** | **365 (71.6%)** | **44 (8.6%)** | **101 (19.8%)** | **89.2%** | **1.14 ms** |
 
 ### Strategy 2: Guarded Syntactic Sandbox (Excludes `{}` & Ambiguous Nested Steals)
 
 | Mutation Type | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Missing `)`** | 252 | 137 (54.4%) | 18 (7.1%) | 97 (38.5%) | **88.4%** | 0.98 ms |
-| **Missing `]`** | 3 | 1 (33.3%) | 0 (0.0%) | 2 (66.7%) | **100.0%** | 2.35 ms |
-| **Missing `}`** | 95 | 0 (0.0%) | 0 (0.0%) | 95 (100.0%) | **100.0%** | 3.71 ms |
-| **Extra `)`** | 252 | 229 (90.9%) | 0 (0.0%) | 23 (9.1%) | **100.0%** | 2.94 ms |
-| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 2.57 ms |
-| **Extra `}`** | 94 | 0 (0.0%) | 0 (0.0%) | 94 (100.0%) | **100.0%** | 1.05 ms |
-| **Total `()` / `[]`** | **510** | **370 (72.5%)** | **18 (3.5%)** | **122 (23.9%)** | **95.4%** | **1.97 ms** |
+| **Missing `)`** | 252 | 90 (35.7%) | 0 (0.0%) | 162 (64.3%) | **100.0%** | 0.79 ms |
+| **Missing `]`** | 3 | 0 (0.0%) | 0 (0.0%) | 3 (100.0%) | **100.0%** | 1.78 ms |
+| **Missing `}`** | 95 | 0 (0.0%) | 0 (0.0%) | 95 (100.0%) | **100.0%** | 3.86 ms |
+| **Extra `)`** | 252 | 229 (90.9%) | 0 (0.0%) | 23 (9.1%) | **100.0%** | 3.05 ms |
+| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 2.71 ms |
+| **Extra `}`** | 94 | 0 (0.0%) | 0 (0.0%) | 94 (100.0%) | **100.0%** | 1.04 ms |
+| **Total `()` / `[]`** | **510** | **322 (63.1%)** | **0 (0.0%)** | **188 (36.9%)** | **100.0%** | **1.93 ms** |
 
 ### Strategy 3: Hybrid (Guarded Syntactic + Semantic Argument/Property Hints)
 
 | Mutation Type | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Missing `)`** | 252 | 158 (62.7%) | 18 (7.1%) | 76 (30.2%) | **89.8%** | 2.09 ms |
-| **Missing `]`** | 3 | 1 (33.3%) | 0 (0.0%) | 2 (66.7%) | **100.0%** | 5.06 ms |
-| **Missing `}`** | 95 | 0 (0.0%) | 0 (0.0%) | 95 (100.0%) | **100.0%** | 5.02 ms |
-| **Extra `)`** | 252 | 229 (90.9%) | 0 (0.0%) | 23 (9.1%) | **100.0%** | 4.11 ms |
-| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 5.48 ms |
-| **Extra `}`** | 94 | 0 (0.0%) | 0 (0.0%) | 94 (100.0%) | **100.0%** | 1.85 ms |
-| **Total `()` / `[]`** | **510** | **391 (76.7%)** | **18 (3.5%)** | **101 (19.8%)** | **95.6%** | **3.13 ms** |
-
----
-
-## Key Takeaways
-
-1. **Deleting Extra `)` / `]` is 100% Precise (`232 / 232` when applied, `91%` recall):**
-   - Combining unmatched closer tokens in the scanner stream with `Expected to find ';'` errors on `)` / `]` tokens mid-expression fixes over 90% of extra-bracket errors with **0 false positives**.
-2. **Why Pure Syntax Has a "Shifted Paren" Trap on Missing `)`:**
-   - When an inner `(` is missing its `)`, it steals the outer `)` and shifts the synthetic `)` to the end of the outer call or expression, which often still parses with **0 syntax errors**:
-     - *Swallowed outer arguments:* `Container(padding: EdgeInsets.all(8, child: Text('hi'))` parses cleanly with `child:` inside `EdgeInsets.all(...)` if the synthetic `)` is placed at the end.
-     - *Swallowed property/operator suffix:* `Theme.of(context).platform` (missing `)`) parses cleanly as `Theme.of(context.platform)` when `)` is placed at the end.
-3. **Using Existing Semantic Diagnostics Fixes Nested Widget Calls for Free:**
-   - During quick-fix computation in `analysis_server`, `ResolvedUnitResult.diagnostics` is already available. Using `undefined_named_parameter` / `extra_positional_arguments` / `undefined_getter` offsets inside unclosed `BeginToken` spans recovers nested widget calls without needing any extra resolution passes.
+| **Missing `)`** | 252 | 111 (44.0%) | 0 (0.0%) | 141 (56.0%) | **100.0%** | 1.71 ms |
+| **Missing `]`** | 3 | 0 (0.0%) | 0 (0.0%) | 3 (100.0%) | **100.0%** | 4.54 ms |
+| **Missing `}`** | 95 | 0 (0.0%) | 0 (0.0%) | 95 (100.0%) | **100.0%** | 5.22 ms |
+| **Extra `)`** | 252 | 229 (90.9%) | 0 (0.0%) | 23 (9.1%) | **100.0%** | 4.28 ms |
+| **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 5.39 ms |
+| **Extra `}`** | 94 | 0 (0.0%) | 0 (0.0%) | 94 (100.0%) | **100.0%** | 1.77 ms |
+| **Total `()` / `[]`** | **510** | **343 (67.3%)** | **0 (0.0%)** | **167 (32.7%)** | **100.0%** | **3.01 ms** |

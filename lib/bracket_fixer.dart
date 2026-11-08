@@ -305,35 +305,35 @@ String? fixStrategy2GuardedSyntactic(String initialCode) {
     bool isAmbiguousSteal = false;
     Token? scan = begin.next;
     while (scan != null && scan != syn && !scan.isEof) {
-      // Case A: An inner group of the SAME bracket kind closed right before `syn`
-      // (or before a suffix/operator that ends at `syn`), meaning the inner
-      // group may have stolen `begin`'s closing token!
+      // Case A: Any top-level binary operator, `.` / `?.`, `!`, `=`, or `?` inside
+      // an unclosed `(` or `[` means the closer could have gone BEFORE that operator
+      // (e.g. `math.cos(angle) * _radius!`, `Theme.of(context).platform`, `lerp(a, b, t)!`,
+      // or `assert(cond), _field = val`).
+      if (scan.type == TokenType.PERIOD ||
+          scan.type == TokenType.QUESTION_PERIOD ||
+          scan.type == TokenType.BANG ||
+          scan.type == TokenType.EQ ||
+          scan.type == TokenType.QUESTION ||
+          scan.type.isBinaryOperator) {
+        isAmbiguousSteal = true;
+      }
+
+      // Case B: An inner group of the SAME bracket kind inside `[begin .. syn]`
+      // could have stolen `begin`'s closing token!
       if (scan is BeginToken &&
           scan.type == begin.type &&
           scan.endGroup != null &&
           !scan.endGroup!.isSynthetic) {
         final innerEnd = scan.endGroup!;
-        if (innerEnd.next == syn) {
-          // Check if the inner group swallowed a comma, period, or binary operator
-          if (_groupContainsAmbiguousContinuation(scan, innerEnd)) {
-            isAmbiguousSteal = true;
-          }
-        } else if (innerEnd.next != null &&
-            (innerEnd.next!.type.isBinaryOperator ||
-                innerEnd.next!.type == TokenType.PERIOD ||
-                innerEnd.next!.type == TokenType.QUESTION_PERIOD)) {
+        // If the inner group swallowed any comma, operator, or period, or is followed by a comma/operator
+        if (_groupContainsAmbiguousContinuation(scan, innerEnd) ||
+            (innerEnd.next != null &&
+                (innerEnd.next!.type == TokenType.COMMA ||
+                    innerEnd.next!.type.isBinaryOperator ||
+                    innerEnd.next!.type == TokenType.PERIOD ||
+                    innerEnd.next!.type == TokenType.QUESTION_PERIOD))) {
           isAmbiguousSteal = true;
         }
-      }
-
-      // Case B: If `begin` is `[` (e.g. index expression `items[i].value == x`),
-      // and inside `[begin .. syn]` there is a `.` or binary operator, the `]`
-      // could have belonged before `.` or `==`.
-      if (begin.type == TokenType.OPEN_SQUARE_BRACKET &&
-          (scan.type == TokenType.PERIOD ||
-              scan.type == TokenType.QUESTION_PERIOD ||
-              scan.type.isBinaryOperator)) {
-        isAmbiguousSteal = true;
       }
 
       // Case C: `if (a && (b || c) {` where `{` is inside `(`
@@ -343,11 +343,27 @@ String? fixStrategy2GuardedSyntactic(String initialCode) {
         if (beforeCurly != null &&
             !beforeCurly.isSynthetic &&
             beforeCurly.type == TokenType.CLOSE_PAREN) {
-          edits.add((
-            offset: beforeCurly.charEnd,
-            length: 0,
-            replacement: ')',
-          ));
+          // Only safe if the inner `(... beforeCurly)` didn't swallow a comma or binary operator
+          // after an even deeper group, OR if `beforeCurly` is NOT the end of a call argument list
+          // that swallowed `&&` / `||`!
+          bool innerSwallowedOp = false;
+          Token? check = begin.next;
+          while (check != null && check != beforeCurly && !check.isEof) {
+            if (check is BeginToken && check.endGroup == beforeCurly) {
+              if (_groupContainsAmbiguousContinuation(check, beforeCurly)) {
+                innerSwallowedOp = true;
+              }
+              break;
+            }
+            check = check.next;
+          }
+          if (!innerSwallowedOp) {
+            edits.add((
+              offset: beforeCurly.charEnd,
+              length: 0,
+              replacement: ')',
+            ));
+          }
           isAmbiguousSteal = true;
         }
       }
@@ -360,7 +376,16 @@ String? fixStrategy2GuardedSyntactic(String initialCode) {
     }
 
     if (!isAmbiguousSteal) {
-      final before = syn.beforeSynthetic;
+      var before = syn.beforeSynthetic;
+      // Place the closer BEFORE a trailing comma if `before` is `,` and `before.previous` is `)` or `]`
+      // (e.g. `Center(child: CircularProgressIndicator(),` -> `Center(child: CircularProgressIndicator()),`)
+      if (before != null &&
+          before.type == TokenType.COMMA &&
+          before.previous != null &&
+          (before.previous!.type == TokenType.CLOSE_PAREN ||
+              before.previous!.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+        before = before.previous;
+      }
       final insertAt = before != null ? before.charEnd : syn.charOffset;
       edits.add((
         offset: insertAt,
@@ -563,15 +588,27 @@ class _BrokenAstSemanticVisitor extends RecursiveAstVisitor<void> {
         final name = arg.name.label.name;
         if (validNamed != null && !validNamed.contains(name) && prevArg != null) {
           // `arg` is an undefined_named_parameter on `targetName`!
-          // Propose closing the inner invocation right after `prevArg` (before the comma).
-          offsets.add(prevArg.end);
+          // Wait: if `prevArg` ends with `)` (an inner call inside `prevArg`),
+          // either `targetName` was missing `)` (after `,`) OR the inner call inside
+          // `prevArg` was missing `)` (before `,`)! Both `prevArg.end` (before `,`)
+          // and after `,` should be checked, or if `prevArg` ends with `)`, prefer
+          // `prevArg.end` ONLY if `prevArg` does not contain nested calls that could
+          // have stolen `targetName`'s `)`!
+          bool prevHasNestedCallAtEnd = prevArg.endToken.type == TokenType.CLOSE_PAREN &&
+              (prevArg is MethodInvocation || prevArg is InstanceCreationExpression || prevArg is BinaryExpression);
+          if (!prevHasNestedCallAtEnd) {
+            offsets.add(prevArg.end);
+          }
           break;
         }
       } else {
         posCount++;
         if (maxPos != null && posCount > maxPos && prevArg != null) {
-          // `arg` exceeds max positional arguments (`extra_positional_arguments`)!
-          offsets.add(prevArg.end);
+          bool prevHasNestedCallAtEnd = prevArg.endToken.type == TokenType.CLOSE_PAREN &&
+              (prevArg is MethodInvocation || prevArg is InstanceCreationExpression || prevArg is BinaryExpression);
+          if (!prevHasNestedCallAtEnd) {
+            offsets.add(prevArg.end);
+          }
           break;
         }
       }
