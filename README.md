@@ -94,8 +94,10 @@ Under the hood, `_fe_analyzer_shared` already maintains rich bracket-pairing met
 When pasting code, there are often **multiple** missing/extra brackets at once (e.g., missing `))` or `)]` at the end of a pasted expression, extra `))` at the end, a mismatched `]` instead of `)`, or multiple independent errors).
 
 `fixStrategy3MultiPass` handles these by:
-1. Trying to apply all non-overlapping guarded edits in a single batch pass, or grouping multiple synthetic closers that land at the exact same offset (e.g. `))` or `)]` before `;`), and
-2. Otherwise stepping iteratively (up to 5 steps) by picking the unique edit that strictly reduces total bracket imbalance (`syntheticClosers + unmatchedClosers`) and syntax error count, accepting the result **only** if it reaches a 100% clean parse with no ties.
+1. Trying to apply all non-overlapping guarded edits in a single batch pass,
+2. Grouping multiple synthetic closers that land at the exact same statement/block boundary in reverse (LIFO) order (e.g. `)]))` before `;`, checking the operator/steal guard on the innermost unclosed group),
+3. Expanding around any flagged extra closer to test deleting 2, 3, or 4 adjacent `)` / `]` tokens in a contiguous run (`)))` / `)])`), and
+4. Otherwise stepping iteratively (up to 5–8 steps) by picking the unique edit that strictly reduces total bracket imbalance (`syntheticClosers + unmatchedClosers`) and syntax error count, accepting the result **only** if it reaches a 100% clean parse with no ties.
 
 | Scenario | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
