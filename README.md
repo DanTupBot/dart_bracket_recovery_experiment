@@ -86,3 +86,22 @@ Under the hood, `_fe_analyzer_shared` already maintains rich bracket-pairing met
 | **Extra `]`** | 3 | 3 (100.0%) | 0 (0.0%) | 0 (0.0%) | **100.0%** | 5.39 ms |
 | **Extra `}`** | 94 | 0 (0.0%) | 0 (0.0%) | 94 (100.0%) | **100.0%** | 1.77 ms |
 | **Total `()` / `[]`** | **510** | **343 (67.3%)** | **0 (0.0%)** | **167 (32.7%)** | **100.0%** | **3.01 ms** |
+
+---
+
+## Multi-Bracket / Paste Scenarios (Strategy 3 Multi-Pass)
+
+When pasting code, there are often **multiple** missing/extra brackets at once (e.g., missing `))` or `)]` at the end of a pasted expression, extra `))` at the end, a mismatched `]` instead of `)`, or multiple independent errors).
+
+`fixStrategy3MultiPass` handles these by:
+1. Trying to apply all non-overlapping guarded edits in a single batch pass, or grouping multiple synthetic closers that land at the exact same offset (e.g. `))` or `)]` before `;`), and
+2. Otherwise stepping iteratively (up to 5 steps) by picking the unique edit that strictly reduces total bracket imbalance (`syntheticClosers + unmatchedClosers`) and syntax error count, accepting the result **only** if it reaches a 100% clean parse with no ties.
+
+| Scenario | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Contiguous Missing (2 adjacent `)`/`]`)** | 138 | 34 (24.6%) | 0 (0.0%) | 104 (75.4%) | **100.0%** | 4.35 ms |
+| **Contiguous Extra (2 adjacent `)`/`]`)** | 138 | 109 (79.0%) | 0 (0.0%) | 29 (21.0%) | **100.0%** | 23.18 ms |
+| **Mismatched Closer (`)` <-> `]`)** | 210 | 103 (49.0%) | 0 (0.0%) | 107 (51.0%) | **100.0%** | 6.63 ms |
+| **Two Independent Errors in File** | 126 | 42 (33.3%) | 0 (0.0%) | 84 (66.7%) | **100.0%** | 8.88 ms |
+| **Total Multi-Bracket** | **612** | **288 (47.1%)** | **0 (0.0%)** | **324 (52.9%)** | **100.0%** | **10.33 ms** |
+

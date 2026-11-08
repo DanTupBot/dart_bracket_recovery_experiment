@@ -230,6 +230,125 @@ Future<void> main(List<String> args) async {
     'Strategy 3: Hybrid (Guarded Syntactic + Semantic Argument/Property Hints)',
     s3ByKind,
   );
+
+  // Also run multi-bracket / paste scenarios using `fixStrategy3MultiPass`
+  _runMultiBracketScenarios(files, seed);
+}
+
+void _runMultiBracketScenarios(List<File> files, int seed) {
+  final rng = Random(seed);
+  final scenarios = {
+    'Contiguous Missing (2 adjacent `)`/`]`)': Stats(),
+    'Contiguous Extra (2 adjacent `)`/`]`)': Stats(),
+    'Mismatched Closer (`)` <-> `]`)': Stats(),
+    'Two Independent Errors in File': Stats(),
+  };
+
+  for (final file in files) {
+    final content = file.readAsStringSync();
+    if (!isCleanParse(content)) continue;
+    final origNorm = normalizeCode(content);
+    final origNormNoTrailingComma =
+        origNorm.replaceAll(',)', ')').replaceAll(',]', ']');
+    final semanticIndex = SemanticIndex.fromCleanCode(content);
+    final res = parseString(content: content, throwIfDiagnostics: false);
+
+    final closers = <Token>[];
+    Token? t = res.unit.beginToken;
+    while (t != null && !t.isEof) {
+      if (!t.isSynthetic &&
+          (t.type == TokenType.CLOSE_PAREN ||
+              t.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+        closers.add(t);
+      }
+      t = t.next;
+    }
+
+    final adjacentPairs = <(Token, Token)>[];
+    for (int i = 0; i < closers.length - 1; i++) {
+      final c1 = closers[i];
+      final c2 = closers[i + 1];
+      if (c1.next == c2 || (c1.next?.type == TokenType.COMMA && c1.next?.next == c2)) {
+        adjacentPairs.add((c1, c2));
+      }
+    }
+
+    adjacentPairs.shuffle(rng);
+    for (final (c1, c2) in adjacentPairs.take(15)) {
+      final brokenMissing2 = content.replaceRange(c1.charOffset, c2.charEnd, '');
+      if (!isCleanParse(brokenMissing2)) {
+        final sw = Stopwatch()..start();
+        final fixed = fixStrategy3MultiPass(brokenMissing2, semanticIndex);
+        sw.stop();
+        final fixedNorm = fixed != null
+            ? normalizeCode(fixed).replaceAll(',)', ')').replaceAll(',]', ']')
+            : null;
+        scenarios['Contiguous Missing (2 adjacent `)`/`]`)']!
+            .record(fixedNorm, origNormNoTrailingComma, sw.elapsedMicroseconds);
+      }
+
+      final brokenExtra2 = content
+          .replaceRange(c2.charOffset, c2.charEnd, '${c2.lexeme}${c2.lexeme}')
+          .replaceRange(c1.charOffset, c1.charEnd, '${c1.lexeme}${c1.lexeme}');
+      if (!isCleanParse(brokenExtra2)) {
+        final sw = Stopwatch()..start();
+        final fixed = fixStrategy3MultiPass(brokenExtra2, semanticIndex);
+        sw.stop();
+        scenarios['Contiguous Extra (2 adjacent `)`/`]`)']!
+            .record(fixed, origNorm, sw.elapsedMicroseconds);
+      }
+    }
+
+    closers.shuffle(rng);
+    for (final c in closers.take(15)) {
+      final wrongChar = c.type == TokenType.CLOSE_PAREN ? ']' : ')';
+      final brokenMismatch = content.replaceRange(c.charOffset, c.charEnd, wrongChar);
+      if (!isCleanParse(brokenMismatch)) {
+        final sw = Stopwatch()..start();
+        final fixed = fixStrategy3MultiPass(brokenMismatch, semanticIndex);
+        sw.stop();
+        scenarios['Mismatched Closer (`)` <-> `]`)']!
+            .record(fixed, origNorm, sw.elapsedMicroseconds);
+      }
+    }
+
+    for (int i = 0; i + 1 < closers.length && i < 20; i += 2) {
+      final cA = closers[i];
+      final cB = closers[i + 1];
+      if ((cA.charOffset - cB.charOffset).abs() < 200) continue;
+      final first = cA.charOffset < cB.charOffset ? cA : cB;
+      final second = cA.charOffset < cB.charOffset ? cB : cA;
+      final brokenIndep = content
+          .replaceRange(second.charOffset, second.charEnd, '${second.lexeme}${second.lexeme}')
+          .replaceRange(first.charOffset, first.charEnd, '');
+      if (!isCleanParse(brokenIndep)) {
+        final sw = Stopwatch()..start();
+        final fixed = fixStrategy3MultiPass(brokenIndep, semanticIndex);
+        sw.stop();
+        scenarios['Two Independent Errors in File']!
+            .record(fixed, origNorm, sw.elapsedMicroseconds);
+      }
+    }
+  }
+
+  stdout.writeln('### Multi-Bracket / Paste Scenarios (Strategy 3 Multi-Pass)\n');
+  stdout.writeln(
+    '| Scenario | Total | Exact Fix | Wrong (Shifted) | Unfixed | Precision (When Applied) | Avg Time |',
+  );
+  stdout.writeln(
+    '| :--- | :---: | :---: | :---: | :---: | :---: | :---: |',
+  );
+  for (final e in scenarios.entries) {
+    final s = e.value;
+    stdout.writeln(
+      '| **${e.key}** | ${s.total} | ${s.exact} (${s.exactPct.toStringAsFixed(1)}%) | '
+      '${s.wrong} (${s.wrongPct.toStringAsFixed(1)}%) | '
+      '${s.unfixed} (${s.unfixedPct.toStringAsFixed(1)}%) | '
+      '**${s.precisionWhenApplied.toStringAsFixed(1)}%** | '
+      '${s.avgMs.toStringAsFixed(2)} ms |',
+    );
+  }
+  stdout.writeln();
 }
 
 void _runAllStrategies(

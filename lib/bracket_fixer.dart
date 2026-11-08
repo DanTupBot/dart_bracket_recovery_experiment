@@ -560,6 +560,278 @@ List<int> _findSemanticSplitOffsets(
   return offsets;
 }
 
+/// Collects all guarded candidate edits (deletions of unmatched closers,
+/// guarded synthetic closer insertions, and semantic split insertions) for a
+/// single pass of Strategy 3.
+List<({int offset, int length, String replacement})> collectStrategy3Edits(
+  String code,
+  SemanticIndex semanticIndex,
+) {
+  final res = parseString(content: code, throwIfDiagnostics: false);
+  final matchedClosers = <Token>{};
+  final syntheticClosers = <BeginToken, Token>{};
+  Token? t = res.unit.beginToken;
+  while (t != null && !t.isEof) {
+    if (t is BeginToken) {
+      final end = t.endGroup;
+      if (end != null) {
+        if (end.isSynthetic) {
+          syntheticClosers[t] = end;
+        } else {
+          matchedClosers.add(end);
+        }
+      }
+    }
+    t = t.next;
+  }
+
+  final edits = <({int offset, int length, String replacement})>[];
+
+  t = res.unit.beginToken;
+  while (t != null && !t.isEof) {
+    if (!t.isSynthetic &&
+        (t.type == TokenType.CLOSE_PAREN ||
+            t.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+      if (!matchedClosers.contains(t)) {
+        final prev = t.previous;
+        if (prev == null ||
+            prev.isSynthetic ||
+            (prev.type != TokenType.COMMA && !prev.type.isBinaryOperator)) {
+          edits.add((offset: t.charOffset, length: t.charCount, replacement: ''));
+        }
+      }
+    }
+    t = t.next;
+  }
+
+  for (final err in res.errors) {
+    if (err.errorCode.name.toLowerCase() == 'expected_token' &&
+        err.message.contains("';'")) {
+      Token? cur = res.unit.beginToken;
+      while (cur != null && !cur.isEof) {
+        if ((cur.charOffset == err.offset || cur.charEnd == err.offset) &&
+            (cur.type == TokenType.CLOSE_PAREN ||
+                cur.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+          edits.add((offset: cur.charOffset, length: cur.charCount, replacement: ''));
+        }
+        cur = cur.next;
+      }
+    }
+  }
+
+  for (final entry in syntheticClosers.entries) {
+    final begin = entry.key;
+    final syn = entry.value;
+    if (begin.type != TokenType.OPEN_PAREN &&
+        begin.type != TokenType.OPEN_SQUARE_BRACKET) {
+      continue;
+    }
+
+    // 1. Semantic split candidates inside [begin .. syn]
+    final semanticCandidates = _findSemanticSplitOffsets(
+      res.unit,
+      begin,
+      syn,
+      semanticIndex,
+    );
+    for (final offset in semanticCandidates) {
+      edits.add((offset: offset, length: 0, replacement: syn.lexeme));
+    }
+
+    // 2. Guarded syntactic closer at `syn` (only if no semantic split was needed inside this group!)
+    bool isAmbiguousSteal = semanticCandidates.isNotEmpty;
+    Token? scan = begin.next;
+    while (scan != null && scan != syn && !scan.isEof) {
+      if (scan.type == TokenType.PERIOD ||
+          scan.type == TokenType.QUESTION_PERIOD ||
+          scan.type == TokenType.BANG ||
+          scan.type == TokenType.EQ ||
+          scan.type == TokenType.QUESTION ||
+          scan.type.isBinaryOperator) {
+        isAmbiguousSteal = true;
+      }
+      if (scan is BeginToken &&
+          scan.type == begin.type &&
+          scan.endGroup != null &&
+          !scan.endGroup!.isSynthetic) {
+        final innerEnd = scan.endGroup!;
+        if (_groupContainsAmbiguousContinuation(scan, innerEnd) ||
+            (innerEnd.next != null &&
+                (innerEnd.next!.type == TokenType.COMMA ||
+                    innerEnd.next!.type.isBinaryOperator ||
+                    innerEnd.next!.type == TokenType.PERIOD ||
+                    innerEnd.next!.type == TokenType.QUESTION_PERIOD))) {
+          isAmbiguousSteal = true;
+        }
+      }
+      if (scan.type == TokenType.OPEN_CURLY_BRACKET &&
+          begin.type == TokenType.OPEN_PAREN) {
+        isAmbiguousSteal = true;
+      }
+      if (scan is BeginToken && scan.endGroup != null && !scan.endGroup!.isSynthetic) {
+        scan = scan.endGroup!.next;
+      } else {
+        scan = scan.next;
+      }
+    }
+
+    if (!isAmbiguousSteal) {
+      var before = syn.beforeSynthetic;
+      if (before != null &&
+          before.type == TokenType.COMMA &&
+          before.previous != null &&
+          (before.previous!.type == TokenType.CLOSE_PAREN ||
+              before.previous!.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+        before = before.previous;
+      }
+      final insertAt = before != null ? before.charEnd : syn.charOffset;
+      edits.add((offset: insertAt, length: 0, replacement: syn.lexeme));
+    }
+  }
+
+  return edits;
+}
+
+/// Multi-pass / batch solver for Strategy 3:
+/// Handles multiple missing, extra, or mismatched brackets (such as pasting code
+/// with `))` or `)]` missing/extra at the end, or `]` instead of `)`).
+String? fixStrategy3MultiPass(
+  String initialCode,
+  SemanticIndex semanticIndex, {
+  int maxSteps = 5,
+}) {
+  var currentCode = initialCode;
+
+  for (int step = 0; step < maxSteps; step++) {
+    if (isCleanParse(currentCode) && !_hasSemanticViolation(currentCode, semanticIndex)) {
+      return currentCode;
+    }
+
+    final singleFix = fixStrategy3SemanticHybrid(currentCode, semanticIndex);
+    if (singleFix != null) {
+      return singleFix;
+    }
+
+    final edits = collectStrategy3Edits(currentCode, semanticIndex);
+    if (edits.isEmpty) return null;
+
+    // 1. Try batch-applying all non-overlapping edits at once
+    if (edits.length > 1) {
+      final batchCandidate = _applyNonOverlappingEdits(currentCode, edits);
+      if (batchCandidate != currentCode &&
+          isCleanParse(batchCandidate) &&
+          !_hasSemanticViolation(batchCandidate, semanticIndex)) {
+        return batchCandidate;
+      }
+    }
+
+    // 2. Try grouping multiple insertions at the exact same offset (e.g. `))` or `)]` at `;`)
+    final byOffset = <int, StringBuffer>{};
+    for (final edit in edits) {
+      if (edit.length == 0) {
+        byOffset.putIfAbsent(edit.offset, () => StringBuffer()).write(edit.replacement);
+      }
+    }
+    for (final entry in byOffset.entries) {
+      if (entry.value.length > 1) {
+        final cand = currentCode.replaceRange(entry.key, entry.key, entry.value.toString());
+        if (isCleanParse(cand) && !_hasSemanticViolation(cand, semanticIndex)) {
+          return cand;
+        }
+      }
+    }
+
+    // 3. Otherwise, take the single edit that strictly reduces bracket imbalance + error count,
+    //    ONLY if there is a unique best edit (no ties between competing split offsets).
+    final baseScore = _imbalanceScore(currentCode);
+    String? bestNext;
+    int bestScore = baseScore;
+    bool tied = false;
+    for (final edit in edits) {
+      final cand = currentCode.replaceRange(
+        edit.offset,
+        edit.offset + edit.length,
+        edit.replacement,
+      );
+      final score = _imbalanceScore(cand);
+      if (score < bestScore) {
+        bestScore = score;
+        bestNext = cand;
+        tied = false;
+      } else if (score == bestScore &&
+          bestNext != null &&
+          normalizeCode(cand) != normalizeCode(bestNext)) {
+        tied = true;
+      }
+    }
+    if (bestNext == null || tied) return null;
+    currentCode = bestNext;
+  }
+
+  if (isCleanParse(currentCode) && !_hasSemanticViolation(currentCode, semanticIndex)) {
+    return currentCode;
+  }
+  return null;
+}
+
+int _imbalanceScore(String code) {
+  final res = parseString(content: code, throwIfDiagnostics: false);
+  int syntheticClosers = 0;
+  int unmatchedClosers = 0;
+  int syntheticOther = 0;
+  final matchedClosers = <Token>{};
+  Token? t = res.unit.beginToken;
+  while (t != null && !t.isEof) {
+    if (t is BeginToken && t.endGroup != null) {
+      if (t.endGroup!.isSynthetic) {
+        syntheticClosers++;
+      } else {
+        matchedClosers.add(t.endGroup!);
+      }
+    } else if (t.isSynthetic) {
+      syntheticOther++;
+    }
+    t = t.next;
+  }
+  t = res.unit.beginToken;
+  while (t != null && !t.isEof) {
+    if (!t.isSynthetic &&
+        (t.type == TokenType.CLOSE_PAREN ||
+            t.type == TokenType.CLOSE_SQUARE_BRACKET)) {
+      if (!matchedClosers.contains(t)) {
+        unmatchedClosers++;
+      }
+    }
+    t = t.next;
+  }
+  return (syntheticClosers + unmatchedClosers) * 100 +
+      res.errors.length * 10 +
+      syntheticOther;
+}
+
+String _applyNonOverlappingEdits(
+  String code,
+  List<({int offset, int length, String replacement})> edits,
+) {
+  final indexed = edits.indexed.toList()
+    ..sort((a, b) {
+      final cmp = b.$2.offset.compareTo(a.$2.offset);
+      if (cmp != 0) return cmp;
+      return b.$1.compareTo(a.$1);
+    });
+
+  var result = code;
+  int lastStart = result.length + 1;
+  for (final (_, edit) in indexed) {
+    final end = edit.offset + edit.length;
+    if (end <= lastStart) {
+      result = result.replaceRange(edit.offset, end, edit.replacement);
+      lastStart = edit.offset;
+    }
+  }
+  return result;
+}
+
 class _BrokenAstSemanticVisitor extends RecursiveAstVisitor<void> {
   final BeginToken outerBegin;
   final Token synEnd;
