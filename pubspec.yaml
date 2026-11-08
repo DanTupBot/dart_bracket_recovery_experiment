@@ -1,0 +1,13 @@
+name: dart_bracket_recovery_experiment
+description: Experiments and benchmarks for recovering missing/extra brackets and parentheses in Dart code using the analyzer token stream and parser.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.7.0
+
+dependencies:
+  _fe_analyzer_shared: any
+  analyzer: ^8.0.0
+  args: ^2.5.0
+  path: ^1.9.0
